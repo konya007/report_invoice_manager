@@ -165,49 +165,6 @@ Pusher/Reverb cho notifications, inventory updates, dashboard stats.
 
 ---
 
-## 🎓 Lộ trình nghiên cứu
-
-### Ban đầu
-```mermaid
-graph LR
-    A[Setup] --> B[Architecture]
-    B --> C[Create Simple Module]
-    C --> D[Add CRUD]
-```
-
-1. Setup environment
-2. Hiểu MVC + Livewire flow
-3. Tạo module Customer management (guided)
-4. Practice CRUD operations
-
-### Trung bình
-```mermaid
-graph LR
-    A[Service Layer] --> B[Invoice System]
-    B --> C[Inventory]
-    C --> D[API Development]
-```
-
-1. Deep dive Service Layer pattern
-2. Invoice creation workflow
-3. Inventory calculations
-4. Build API endpoints
-
-### Nâng cao
-```mermaid
-graph LR
-    A[AI Integration] --> B[Email Automation]
-    B --> C[Real-time Features]
-    C --> D[Performance Tuning]
-```
-
-1. Gemini AI function calling
-2. Gmail API integration
-3. Pusher/Reverb real-time
-4. Cache strategies, optimization
-
----
-
 ## 📚 Các tài liệu tham khảo liên quan
 
 ### Official Documentation
@@ -226,19 +183,6 @@ graph LR
 - [Laravel News](https://laravel-news.com/)
 - [Livewire Discord](https://discord.gg/livewire)
 - [Laracasts](https://laracasts.com/)
-
----
-
-
-### Mẫu code ví dụ
-Tất cả code examples trong docs:
-- ✅ Tested và working
-- ✅ Updated theo codebase hiện tại
-- ✅ Có comments giải thích
-- ✅ Copy-paste ready
-
-### Diagrams
-Sử dụng **Mermaid syntax** - render trực tiếp trong GitHub/VS Code.
 
 ---
 

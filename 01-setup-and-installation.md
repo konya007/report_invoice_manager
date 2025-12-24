@@ -6,14 +6,14 @@
 
 ## 📋 Mục lục
 
-- [Yêu cầu hệ thống](#system-requirements)
-- [Thiết lập phát triển](#development-setup)
-- [Cấu hình môi trường](#environment-configuration)
-- [Thiết lập cơ sở dữ liệu](#database-setup)
-- [Dịch vụ bên thứ ba](#third-party-services)
-- [Chạy lần đầu](#first-run)
-- [Triển khai production](#production-deployment)
-- [Khắc phục sự cố](#troubleshooting)
+- [Yêu cầu hệ thống](#yêu-cầu-hệ-thống)
+- [Thiết lập phát triển](#thiết-lập-phát-triển)
+- [Cấu hình môi trường](#cấu-hình-môi-trường)
+- [Thiết lập cơ sở dữ liệu](#thiết-lập-cơ-sở-dữ-liệu)
+- [Các dịch vụ bên thứ ba](#các-dịch-vụ-bên-thứ-ba)
+- [Chạy lần đầu](#chạy-lần-đầu)
+- [Triển khai production](#triển-khai-production)
+
 ---
 
 ## Yêu cầu hệ thống
@@ -63,7 +63,7 @@ Postman / Insomnia
 
 ---
 
-## Development Setup
+## Thiết lập phát triển
 
 ### 1. Clone Repository
 
@@ -126,7 +126,7 @@ php artisan jwt:secret
 
 ---
 
-## Environment Configuration
+## Cấu hình môi trường
 
 ### Core Settings
 
@@ -278,7 +278,7 @@ MAIL_FROM_NAME="${APP_NAME}"
 
 ---
 
-## Cài đặt Database
+## Thiết lập cơ sở dữ liệu
 
 ### 1. Chạy Migrations
 
@@ -394,7 +394,7 @@ Thông tin đăng nhập mặc định:
 
 ---
 
-## Triển khai trên Production 
+## Triển khai Production
 
 ### Các việc cần làm trước khi triển khai 
 
