@@ -1,14 +1,17 @@
-# Currency System - Documentation
+# 20 - Hệ Thống Tiền Tệ & Tỷ Giá
+
+> Quản lý đa tiền tệ và tự động đồng bộ tỷ giá ngân hàng.
+
+---
 
 ## 📋 Tổng quan
 
-Hệ thống tiền tệ (Currency System) quản lý việc chuyển đổi tỷ giá ngoại tệ, tự động cập nhật tỷ giá từ Vietcombank và lưu trữ lịch sử tỷ giá để phục vụ tính toán tài chính chính xác cho các hóa đơn và báo cáo.
+Hệ thống hỗ trợ nhập/xuất hàng hóa bằng nhiều loại tiền tệ (USD, EUR, JPY...) nhưng luôn quy đổi và hạch toán về đồng tiền cơ sở (VND) để báo cáo tài chính.
 
-**Tính năng chính:**
-- Tự động lấy tỷ giá từ API Vietcombank.
-- Lưu trữ lịch sử tỷ giá theo thời gian thực (snapshot).
-- Hỗ trợ chuyển đổi tiền tệ (Convert to VND).
-- Gắn tỷ giá cụ thể vào từng hóa đơn/sản phẩm để đảm bảo tính lịch sử (không bị thay đổi khi tỷ giá thị trường biến động).
+**Điểm đặc biệt:**
+- **Real-time Sync:** Tự động lấy tỷ giá Vietcombank 10 phút/lần.
+- **Snapshot History:** Lưu trữ tỷ giá tại thời điểm giao dịch. Nếu thị trường biến động sau đó, giá trị hóa đơn cũ **không đổi**.
+- **Smart Deduplication:** Chỉ lưu bản ghi mới nếu tỷ giá thay đổi, tiết kiệm 90% dung lượng DB.
 
 ---
 
@@ -16,67 +19,91 @@ Hệ thống tiền tệ (Currency System) quản lý việc chuyển đổi t�
 
 ### Bảng `transfer_currencies`
 
-Lưu trữ snapshot tỷ giá tại một thời điểm cụ thể.
+Lưu trữ lịch sử tỷ giá.
 
 | Column | Type | Mô tả |
 |--------|------|-------|
-| `id` | BIGINT | Primary Key |
-| `exchange_date` | DATETIME | Thời điểm áp dụng tỷ giá |
-| `source` | VARCHAR | Nguồn dữ liệu (Mặc định: 'Vietcombank') |
-| `rates` | JSON | Danh sách tỷ giá (VD: `{"USD": 25000, "EUR": 27000}`) |
-| `created_at` | TIMESTAMP | Thời gian tạo |
+| `id` | BIGINT | PK |
+| `exchange_date` | DATETIME | Thời điểm lấy tỷ giá Snapshot |
+| `source` | VARCHAR | Nguồn (Default: 'Vietcombank') |
+| `rates` | JSON | Lưu trữ NoSQL dạng: `{"USD": 25450, "EUR": 27100}` |
 
-### Quan hệ
-- **PurchaseInvoice / PurchaseItem**: Có trường `transfer_currency_id` liên kết đến bảng này để chốt tỷ giá tại thời điểm nhập hàng.
+### Tại sao dùng JSON?
+- Linh hoạt: Có thể thêm bất kỳ loại tiền tệ mới nào mà không cần sửa cấu trúc bảng (Migration).
+- Nhanh: Truy xuất toàn bộ bảng tỷ giá trong 1 query.
 
 ---
 
-## 🚀 Cách sử dụng
+## 🚀 Core Services
 
-### 1. Tự động cập nhật tỷ giá
+### 1. `CurrencyExchangeService`
 
-Service `CurrencyExchangeService` chịu trách nhiệm giao tiếp với Vietcombank.
+Mạch máu của hệ thống tiền tệ. Nằm tại `app/Services/App/CurrencyExchangeService.php`.
 
-- **API URL:** `https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx`
-- **Tần suất:** Dữ liệu XML từ Vietcombank thường cập nhật nhiều lần trong ngày.
-- **Logic:**
-  1. Fetch XML từ Vietcombank.
-  2. Parse XML lấy `DateTime` và danh sách `Exrate`.
-  3. Kiểm tra xem đã có bản ghi `transfer_currencies` nào trùng `exchange_date` (phút) chưa.
-  4. Nếu chưa -> Tạo bản ghi mới.
-  5. Nếu có -> Tái sử dụng (tránh spam database).
+#### a. Fetching Logic (Vietcombank Integration)
+- **Endpoint:** `https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx`
+- **Format:** XML
+- **Parser:** Sử dụng `DOMDocument` và `XPath` để parse XML.
 
-### 2. Chuyển đổi tiền tệ
+```xml
+<ExrateList>
+    <DateTime>12/24/2024 8:30:00 AM</DateTime>
+    <Exrate CurrencyCode="USD" CurrencyName="DO LA MY" Buy="25140" Transfer="25170" Sell="25510"/>
+    ...
+</ExrateList>
+```
+
+Hệ thống sẽ lấy giá trị **Transfer** (Chuyển khoản) làm chuẩn để tính toán.
+
+#### b. Deduplication Strategy (Chống trùng lặp)
+Trước khi lưu tỷ giá mới, hệ thống kiểm tra:
+1. Tìm bản ghi mới nhất trong ngày.
+2. So sánh mảng `rates` của bản ghi đó với dữ liệu vừa fetch.
+3. Nếu **GIỐNG HỆT** (sai số < 0.01) -> Bỏ qua, trả về bản ghi cũ.
+4. Nếu **KHÁC** -> Tạo bản ghi `TransferCurrency` mới.
+
+#### c. Conversion Logic
 
 ```php
-use App\Services\App\CurrencyExchangeService;
-
-$service = new CurrencyExchangeService();
-
-// 1. Lấy tỷ giá hiện tại (tự động fetch hoặc lấy cache)
-$transferCurrency = $service->getTransferCurrencyForInvoice();
-
-// 2. Chuyển đổi sang VND
-$vndAmount = $service->convertToVND(
-    amount: 100, 
-    fromCurrency: 'USD', 
-    transferCurrency: $transferCurrency
-);
+public function convertToVND(float $amount, string $currency, ?TransferCurrency $transferRate): float
+{
+    if ($currency === 'VND') return $amount;
+    
+    // Fallback: Nếu không có tỷ giá chỉ định, lấy tỷ giá mới nhất
+    $rateObj = $transferRate ?? $this->getLatestRate();
+    $rate = $rateObj->rates[$currency] ?? 0;
+    
+    return $amount * $rate;
+}
 ```
+
+---
+
+## 🛠 Integration Points
+
+### 1. Hóa đơn mua (Purchase Invoice)
+- Khi tạo hóa đơn USD, hệ thống tự động gọi `getTransferCurrencyForInvoice()`.
+- ID của bản ghi tỷ giá được lưu vào `purchase_invoices.transfer_currency_id`.
+- **Bảo toàn dữ liệu:** Dù tỷ giá ngày mai tăng gấp đôi, hóa đơn hôm nay vẫn dùng ID cũ -> Giá trị nhập kho không bị sai lệch.
+
+### 2. Báo cáo tài chính
+- Doanh thu/Lợi nhuận được tính bằng cách: `SUM(amount * saved_rate)`.
 
 ---
 
 ## ⚙️ Configuration
 
-- **Timeout:** 10 giây cho request đến Vietcombank.
-- **Deduplication:** Hệ thống tự động so sánh tỷ giá để không tạo bản ghi trùng lặp nếu tỷ giá không đổi, giúp tiết kiệm dung lượng database.
+Cấu hình trong `.env` (Hiện tại đang hardcode URL trong service, có thể refactor ra file config).
+
+- **Timeout:** 10s (Tránh treo ứng dụng nếu Vietcombank sập).
+- **Cache:** Có thể bật cache Redis nếu tần suất gọi quá cao.
 
 ---
 
 ## 📚 Related Files
 
-| File | Mô tả |
-|------|-------|
-| `app/Services/App/CurrencyExchangeService.php` | Service chính xử lý logic fetch và convert |
-| `app/Models/TransferCurrency.php` | Model lưu trữ lịch sử tỷ giá (JSON cast) |
-| `app/Services/Utils/FormatService.php` | Helper định dạng hiển thị tiền tệ |
+| File | Type | Mô tả |
+|------|------|-------|
+| `app/Services/App/CurrencyExchangeService.php` | Service | Logic chính fetch & parse |
+| `app/Models/TransferCurrency.php` | Model | Eloquent model với JSON cast |
+| `app/Services/Utils/FormatService.php` | Helper | Format tiền tệ (VD: 1,000,000 ₫) |

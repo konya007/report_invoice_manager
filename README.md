@@ -52,9 +52,8 @@
 |---|------|-------------|
 | 19 | [**Warranty System**](19-warranty-system.md) | Hệ thống bảo hành & hạn sử dụng |
 | 20 | [**Currency System**](20-currency-system.md) | Tỷ giá & chuyển đổi tiền tệ |
-| 21 | [**Inventory FIFO**](21-inventory-system-fifo.md) | Chi tiết thuật toán FIFO & Transactions |
-| 22 | [**Product Conversion**](22-product-conversion-system.md) | Chuyển đổi và lắp ráp sản phẩm |
-| 23 | [**Banking & VietQR**](23-banking-and-vietqr.md) | Tích hợp ngân hàng & VietQR API |
+| 21 | [**Product Conversion**](21-product-conversion-system.md) | Chuyển đổi và lắp ráp sản phẩm |
+| 22 | [**Banking & VietQR**](22-banking-and-vietqr.md) | Tích hợp ngân hàng & VietQR API |
 
 ---
 

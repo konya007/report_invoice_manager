@@ -1,79 +1,115 @@
-# Warranty System - Documentation
+# 19 - Hệ Thống Bảo Hành & Hạn Sử Dụng
+
+> Quản lý chu trình bảo hành và hạn sử dụng sản phẩm theo từng lô nhập hàng.
+
+---
 
 ## 📋 Tổng quan
 
-Hệ thống bảo hành và hạn sử dụng cho phép theo dõi thời gian bảo hành (Warranty) và hạn sử dụng (Expiry) cho từng mặt hàng trong hóa đơn mua/bán.
+Hệ thống bảo hành được thiết kế để theo dõi **vòng đời sau bán hàng** của sản phẩm. Không giống như các hệ thống quản lý bảo hành theo Serial Number từng cái, hệ thống này quản lý theo **Lô hàng nhập (Purchase Item)**.
 
-**Tính năng chính:**
-- Thiết lập số tháng bảo hành cho từng sản phẩm.
-- Thiết lập số tháng hạn sử dụng (Date code/Expiry).
-- Tự động tính ngày hết hạn dựa trên ngày mua hàng.
-- Cảnh báo hoặc hiển thị thông tin bảo hành trên hóa đơn.
+### Tại sao quản lý theo Purchase Item?
+- **Đơn giản hóa:** Không cần nhập Serial cho hàng nghìn sản phẩm giá rẻ.
+- **Linh hoạt:** Cùng một mã sản phẩm (SKU) có thể có thời hạn bảo hành khác nhau tùy theo đợt nhập hàng.
+- **Tự động hóa:** Ngày hết hạn được tính tự động từ ngày mua của khách hàng cộng với chính sách của lô hàng đó.
 
 ---
 
 ## 🗄️ Database Schema
 
-Thông tin bảo hành được lưu trực tiếp trong bảng `purchase_items` (đối với hàng nhập) và có thể được tham chiếu lại khi bán.
+Thông tin cấu hình bảo hành được lưu trữ trực tiếp trong bảng `purchase_items`.
 
 ### Bảng `purchase_items`
 
-| Column | Type | Mô tả |
-|--------|------|-------|
-| `warranty_months` | INT | Số tháng bảo hành (Nullable) |
-| `expiry_months` | INT | Số tháng hạn sử dụng (Nullable) |
+| Column | Type | Default | Mô tả |
+|--------|------|---------|-------|
+| `warranty_months` | INT | NULL | Số tháng bảo hành (VD: 12, 24). Null = Không bảo hành. |
+| `expiry_months` | INT | NULL | Hạn sử dụng (Shelf life) tính từ ngày nhập. |
 
-**Logic tính toán:**
-- **Ngày hết hạn bảo hành** = `Ngày mua hàng (Purchase Date)` + `warranty_months`
-- **Ngày hết hạn sử dụng** = `Ngày mua hàng (Purchase Date)` + `expiry_months`
+**Mối quan hệ:**
+- Một `PurchaseItem` thuộc về một `PurchaseInvoice`.
+- Khi bán hàng (`SaleItem`), hệ thống sẽ truy xuất lại `PurchaseItem` gốc (thông qua FIFO) để xác định thời hạn bảo hành cho khách.
 
 ---
 
-## 🚀 Cách sử dụng
+## 🚀 Logic & Thuật Toán
 
-### 1. Cập nhật thông tin bảo hành
+### 1. Cập nhật thông tin (`WarrantyUpdateModal`)
 
-Thông tin bảo hành được cập nhật thông qua **Modal Cập nhật Bảo hành** (`WarrantyUpdateModal`).
+Việc cập nhật thông tin bảo hành được thực hiện tách biệt với luồng nhập kho, giúp kế toán kho có thể cập nhật sau khi hàng đã về.
 
-**Quy trình:**
-1. Người dùng mở chi tiết hóa đơn mua hàng hoặc danh sách sản phẩm.
-2. Chọn hành động "Cập nhật bảo hành" cho một dòng sản phẩm (`PurchaseItem`).
-3. Nhập số tháng bảo hành và số tháng hạn sử dụng.
-4. Hệ thống tự động hiển thị ngày hết hạn dự kiến.
-5. Lưu lại thông tin.
-
-### 2. Logic xử lý (Frontend)
-
+**Core Logic:**
 File: `app/Livewire/Main/Products/WarrantyUpdateModal.php`
 
-- **Input:** 
-  - `warrantyMonths`: Số nguyên (0-1200)
-  - `expiryMonths`: Số nguyên (0-1200)
-- **Validation:**
-  - `min:0`, `max:1200` (100 năm)
-  - Kiểm tra quyền truy cập công ty (`company_id`).
-- **Calculation:**
-  - Sử dụng `Carbon` để cộng số tháng vào `purchase_date` của hóa đơn gốc.
+```php
+public function saveWarranty(): void
+{
+    // 1. Validate inputs
+    $this->validate([
+        'warrantyMonths' => ['nullable', 'integer', 'min:0', 'max:1200'],
+        'expiryMonths' => ['nullable', 'integer', 'min:0', 'max:1200'],
+    ]);
+
+    // 2. Load & Check Owner
+    $purchaseItem = PurchaseItem::findOrFail($this->purchaseItemId);
+    $this->authorize('update', $purchaseItem); 
+
+    // 3. Update
+    $purchaseItem->warranty_months = $this->warrantyMonths;
+    $purchaseItem->expiry_months = $this->expiryMonths;
+    $purchaseItem->save();
+
+    // 4. Feedback
+    $this->dispatch('refresh');
+}
+```
+
+### 2. Tính toán ngày hết hạn (Calculation)
+
+Hệ thống sử dụng thư viện `Carbon` để tính toán chính xác ngày hết hạn, xử lý các trường hợp năm nhuận hoặc tháng có số ngày khác nhau.
 
 ```php
-// Ví dụ logic tính toán
-$purchaseDate = \Carbon\Carbon::parse($this->purchaseDate);
-$warrantyExpiry = $purchaseDate->copy()->addMonths($this->warrantyMonths);
+// Input: Purchase Date (Ngày khách mua)
+// Logic:
+$warrantyExpiryDate = Carbon::parse($purchaseDate)->addMonths($warrantyMonths);
 ```
+
+**Ví dụ:**
+- Khách mua: 31/01/2024
+- Bảo hành: 1 tháng
+- Hết hạn: 29/02/2024 (Tự động handle năm nhuận)
 
 ---
 
-## ⚙️ Configuration
+## ✨ Features & UI
 
-- **Giới hạn tối đa:** 1200 tháng (tương đương 100 năm).
-- **Quyền hạn:** Yêu cầu quyền sửa đổi sản phẩm hoặc hóa đơn mua hàng.
+### 1. Modal Cập nhật
+- **Giao diện:** Tách biệt, popup modal.
+- **Preview:** Tự động hiển thị "Ngày hết hạn dự kiến" ngay khi nhập số tháng (Live calculation).
+- **Validation:** Chặn nhập số âm hoặc số quá lớn (> 100 năm).
+
+### 2. Hiển thị trên hóa đơn
+- Khi in hóa đơn bán hàng, thông tin bảo hành sẽ được hiển thị dòng dưới tên sản phẩm:
+  > *Bảo hành: 12 tháng (đến 20/12/2025)*
+
+---
+
+## 🔧 Troubleshooting
+
+### Vấn đề: Không lưu được số tháng bảo hành?
+- **Kiểm tra:** User có quyền edit purchase invoice không?
+- **Kiểm tra:** Purchase Invoice đã bị khóa sổ (locked) chưa? (Hiện tại hệ thống cho phép sửa bảo hành ngay cả khi đã approved).
+
+### Vấn đề: Ngày hết hạn hiển thị sai?
+- **Nguyên nhân:** Format ngày tháng đầu vào (`d/m/Y` vs `Y-m-d`).
+- **Fix:** Kiểm tra `Carbon::createFromFormat` trong code.
 
 ---
 
 ## 📚 Related Files
 
-| File | Mô tả |
-|------|-------|
-| `app/Livewire/Main/Products/WarrantyUpdateModal.php` | Component xử lý logic cập nhật |
-| `resources/views/livewire/main/products/warranty-update-modal.blade.php` | Giao diện Modal |
-| `app/Models/PurchaseItem.php` | Model lưu trữ dữ liệu |
+| File | Type | Mô tả |
+|------|------|-------|
+| `app/Models/PurchaseItem.php` | Model | Chứa filed `warranty_months` |
+| `app/Livewire/Main/Products/WarrantyUpdateModal.php` | Livewire | Logic cập nhật |
+| `resources/views/livewire/main/products/warranty-update-modal.blade.php` | View | UI Modal |
