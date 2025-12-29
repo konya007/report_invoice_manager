@@ -1,539 +1,592 @@
 # 10 - Hệ Thống Quét Email
 
-> Tự động nhận và xử lý hóa đơn từ Gmail
+> Tự động nhận và xử lý hóa đơn từ Gmail với keyword filtering và real-time notifications
 
 ---
 
 ## Tổng Quan
 
-### Workflow Tự Động
+Hệ thống quét email tự động:
+- ✅ Nhận email realtime qua **Google Pub/Sub Webhook**
+- ✅ **Notify user ngay lập tức** khi có email mới
+- ✅ **Keyword filtering** - Chỉ xử lý email có từ khóa hóa đơn
+- ✅ **Fallback logic** - Quét inbox khi history API fail
+- ✅ Auto-import invoice từ XML attachments
+- ✅ Quét thủ công với cấu hình linh hoạt
+
+### Workflow Overview
 
 ```mermaid
 sequenceDiagram
-    participant Email as Gmail
+    participant Gmail
     participant PubSub as Google Pub/Sub
-    participant Webhook as Laravel Webhook
-    participant Queue as Queue Job
-    participant Parser as XML Parser
-    participant DB as Database
+    participant Webhook as /api/gmail/webhook
+    participant Job as ProcessNewGmailMessage
+    participant User
     
-    Email->>PubSub: Email mới đến
-    PubSub->>Webhook: Push notification
-    Webhook->>Queue: Dispatch GmailScanJob
-    Queue->>Email: Fetch email content
-    Email-->>Queue: Email + attachments
-    Queue->>Parser: Parse XML invoice
-    Parser->>DB: Create Purchase Invoice
-    DB->>Queue: Success
-    Queue-->>User: Notification
+    Gmail->>PubSub: New email arrives
+    PubSub->>Webhook: Push notification (historyId)
+    Webhook->>Webhook: Deduplicate (cache)
+    Webhook->>Job: Dispatch job (queued)
+    Webhook-->>PubSub: 200 OK (fast response)
+    
+    Job->>Gmail: Fetch histories
+    alt History API Success
+        Gmail-->>Job: Email changes
+    else History 404 (historyId too old)
+        Job->>Gmail: Fallback: Fetch latest INBOX
+Gmail-->>Job: Latest 5-200 emails
+    end
+    
+    Job->>User: Notify ALL new emails
+    Job->>Job: Check keywords
+    alt Has keyword
+        Job->>Job: Check XML attachment
+        alt Has XML
+            Job->>DB: Import invoice
+        else No XML
+            Job->>User: ⚠️ Warning notification
+        end
+    else No keyword
+        Job->>Job: Skip processing
+    end
 ```
 
 ---
 
-## Setup Gmail API
+## Setup Google Cloud
 
-### Bước 1: Google Cloud Console
-
-```
-1. Truy cập: https://console.cloud.google.com
-2. Tạo project mới: "QLHoaDon"
-3. Enable APIs:
-   - Gmail API
-   - Cloud Pub/Sub API
-4. Tạo OAuth 2.0 credentials
-5. Tạo Service Account (cho Pub/Sub)
-```
-
-### Bước 2: Cấu Hình .env
-
-```dotenv
-GOOGLE_PROJECT_ID="your-project-id"
-GOOGLE_CLIENT_ID="xxx.apps.googleusercontent.com"
-GOOGLE_CLIENT_SECRET="GOCSPX-xxx"
-GOOGLE_REDIRECT_URI="https://your-domain.com/auth/google/callback"
-GOOGLE_PUBSUB_TOPIC="mail-checker"
-```
-
-### Bước 3: Service Account
+### 1. Google Cloud Console
 
 ```bash
-# Download service account JSON key
-# Save to: storage/app/credentials/google-service-account.json
+# URL: https://console.cloud.google.com
 
-# File structure:
-{
-  "type": "service_account",
-  "project_id": "...",
-  "private_key_id": "...",
-  "private_key": "-----BEGIN PRIVATE KEY-----\n...",
-  "client_email": "...",
-  ...
-}
+# 1. Tạo project mới
+Project ID: quanlyhoadon-476603
+
+# 2. Enable APIs
+- Gmail API
+- Cloud Pub/Sub API
+
+# 3. Tạo OAuth 2.0 Credentials
+Type: Web application
+Authorized redirect URIs:
+  - https://api2.konnn04.live/auth/google/callback
+  - http://localhost:8000/auth/google/callback
+
+# 4. Tạo Pub/Sub Topic
+Topic name: mail-checker
+```
+
+### 2. Environment Configuration
+
+```dotenv
+# .env
+GOOGLE_PROJECT_ID=quanlyhoadon-476603
+GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxx
+GOOGLE_REDIRECT_URI=https://api2.konnn04.live/auth/google/callback
+GOOGLE_PUBSUB_TOPIC=mail-checker
 ```
 
 ---
 
-## Kết Nối Gmail
+## Gmail OAuth Flow
 
-### OAuth Flow
+### Routes
 
 ```php
-// app/Http/Controllers/Auth/GoogleController.php
+// routes/integrations.php
+
+// Webhook (Public API route - no auth)
+Route::post('/api/gmail/webhook', [GmailWebhookController::class, 'handle'])
+    ->withoutMiddleware(['web'])
+    ->name('api.gmail.webhook');
+
+// OAuth (Web routes - authenticated)
+Route::middleware(['auth', 'company.context', 'permission:company.manage'])->group(function () {
+    Route::get('/auth/google/redirect', [GmailOAuthController::class, 'redirect']);
+    Route::get('/auth/google/callback', [GmailOAuthController::class, 'callback']);
+    Route::post('/auth/google/disconnect', [GmailOAuthController::class, 'disconnect']);
+});
+```
+
+### OAuth Controller
+
+```php
+// app/Http/Controllers/GmailOAuthController.php
+
 public function redirect() {
-    $client = $this->getGoogleClient();
+    $socialite = Socialite::driver('google');
     
-    // Request Gmail read-only scope
-    $client->setScopes([
-        'https://www.googleapis.com/auth/gmail.readonly',
-        'https://www.googleapis.com/auth/gmail.modify',
-    ]);
-    
-    $authUrl = $client->createAuthUrl();
-    return redirect($authUrl);
+    return $socialite
+        ->scopes([
+            'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/gmail.modify',
+        ])
+        ->redirect();
 }
 
 public function callback(Request $request) {
-    $client = $this->getGoogleClient();
-    $token = $client->fetchAccessTokenWithAuthCode($request->code);
+    $googleUser = Socialite::driver('google')->user();
+    $user = Auth::user();
+    $companyId = $user->company_id;
     
-    // Save token to company config
-    $company = Auth::user()->company;
-    $config = $company->config;
+    // Get or create config
+    $config = Config::firstOrCreate(['company_id' => $companyId]);
     
-    $config->updateSetting('gmail_settings', [
-        'access_token' => $token['access_token'],
-        'refresh_token' => $token['refresh_token'] ?? null,
-        'expires_at' => now()->addSeconds($token['expires_in']),
-    ]);
+    // Save tokens
+    $config->gmail_refresh_token = $googleUser->refreshToken ?? $config->gmail_refresh_token;
+    $config->gmail_access_token = $googleUser->token;
+    $config->gmail_account_email = $googleUser->getEmail();
+    $config->gmail_token_expires_at = now()->addSeconds($googleUser->expiresIn ?? 3600);
     
-    // Setup Pub/Sub watch
-    $this->setupPubSubWatch($token['access_token']);
+    // Reset watch if new account
+    $isNewAccount = $old Email !== $newEmail;
+    if ($isNewAccount) {
+        $config->gmail_watch_topic = null;
+        $config->gmail_last_history_id = '-1';
+    }
     
-    return redirect('/settings')
-        ->with('message', 'Kết nối Gmail thành công!');
+    $config->save();
+    
+    // Start Gmail Watch (deferred)
+    if ($isNewAccount) {
+        StartGmailWatch::dispatch($config->id)
+            ->afterResponse()
+            ->onQueue('gmail');
+    }
+    
+    // Auto-scan emails after 30s
+    $rescanLimit = (int) $config->getSetting('automation_settings.rescan_email_limit', 50);
+    RescanAllEmailsJob::dispatch($companyId, $rescanLimit, false)
+        ->delay(now()->addSeconds(30))
+        ->onQueue('gmail');
+    
+    return redirect()->route('settings', ['tab' => 'automation']);
 }
 ```
 
 ---
 
-## Pub/Sub Watch
+## Gmail Watch Setup
 
-### Đăng Ký Nhận Thông Báo
+### StartGmailWatch Job
 
 ```php
-// app/Services/Utils/GmailService.php
-public function setupWatch(string $accessToken): array {
-    $client = new \Google_Client();
-    $client->setAccessToken($accessToken);
+// app/Jobs/StartGmailWatch.php
+
+public function handle(GmailService $gmailService) {
+    $config = Config::withoutGlobalScopes()->find($this->configId);
     
-    $gmail = new \Google_Service_Gmail($client);
+    $client = $gmailService->buildGoogleClient($config);
+    $gmail = new Gmail($client);
     
-    $watchRequest = new \Google_Service_Gmail_WatchRequest();
-    $watchRequest->setTopicName('projects/' . env('GOOGLE_PROJECT_ID') . '/topics/' . env('GOOGLE_PUBSUB_TOPIC'));
-    $watchRequest->setLabelIds(['INBOX']);  // Chỉ inbox
+    // Setup watch request
+    $topic = 'projects/' . env('GOOGLE_PROJECT_ID') . '/topics/' . env('GOOGLE_PUBSUB_TOPIC');
     
-    $watchResponse = $gmail->users->watch('me', $watchRequest);
+    $watchRequest = new WatchRequest();
+    $watchRequest->setTopicName($topic);
+    $watchRequest->setLabelIds(['INBOX']); // Only inbox
     
-    return [
-        'historyId' => $watchResponse->getHistoryId(),
-        'expiration' => $watchResponse->getExpiration(),
-    ];
+    $response = $gmail->users->watch('me', $watchRequest);
+    
+    // Save watch info
+    $config->gmail_watch_topic = $topic;
+    $config->gmail_last_watched_at = now();
+    $config->gmail_last_history_id = $response->getHistoryId();
+    $config->save();
 }
 ```
 
-### Gia Hạn Watch (7 ngày/lần)
-
-```php
-// Schedule task - chạy mỗi 6 ngày
-// app/Console/Kernel.php
-protected function schedule(Schedule $schedule) {
-    $schedule->call(function() {
-        // Renew watch for all companies
-        $companies = Company::whereNotNull('config->gmail_settings->access_token')->get();
-        
-        foreach ($companies as $company) {
-            $token = $company->config->getSetting('gmail_settings.access_token');
-            app(GmailService::class)->setupWatch($token);
-        }
-    })->weekly();
-}
-```
+**Watch expires after 7 days** - Google will stop sending notifications. Cần renew định kỳ hoặc khi reconnect Gmail.
 
 ---
 
 ## Webhook Handler
 
-### Nhận Push Notification
+### GmailWebhookController
 
 ```php
-// routes/integrations.php
-Route::post('/webhook/gmail', [GmailController::class, 'webhook'])
-    ->name('gmail.webhook');
+// app/Http/Controllers/GmailWebhookController.php
 
-// app/Http/Controllers/GmailController.php
-public function webhook(Request $request) {
-    // Pub/Sub sends base64 encoded message
-    $message = json_decode(base64_decode($request->input('message.data')), true);
+public function handle(Request $request) {
+    $startTime = microtime(true);
     
-    $emailAddress = $message['emailAddress'];
-    $historyId = $message['historyId'];
+    // Decode Pub/Sub message
+    $payload = json_decode($request->getContent(), true);
+    $message = $payload['message'] ?? null;
+    $decoded = json_decode(base64_decode($message['data']), true);
+    
+    $historyId = $decoded['historyId'] ?? null;
+    $emailAddress = $decoded['emailAddress'] ?? null;
     
     // Find company by email
-    $company = $this->findCompanyByEmail($emailAddress);
+    $config = Config::withoutGlobalScopes()
+        ->whereRaw('LOWER(gmail_account_email) = ?', [strtolower($emailAddress)])
+        ->first();
+    $companyId = $config?->company_id;
     
-    if ($company) {
-        // Dispatch job to process
-        GmailScanJob::dispatch($company->id, $historyId);
-    }
-    
-    return response()->json(['success' => true]);
-}
-
-private function findCompanyByEmail($email) {
-    return Company::whereHas('users', function($q) use ($email) {
-        $q->where('email', $email);
-    })->first();
-}
-```
-
----
-
-## Queue Job - Xử Lý Email
-
-### Fetch Email Từ Gmail
-
-```php
-// app/Jobs/GmailScanJob.php
-class GmailScanJob implements ShouldQueue {
-    public $companyId;
-    public $historyId;
-    
-    public function handle() {
-        $company = Company::find($this->companyId);
-        $gmailService = app(GmailService::class);
+    if ($companyId) {
+        // Deduplication using cache (5 minutes)
+        $cacheKey = "gmail_webhook_history_{$companyId}_{$historyId}";
         
-        // Get token
-        $token = $company->config->getSetting('gmail_settings.access_token');
-        
-        // Fetch new messages since historyId
-        $messages = $gmailService->getMessagesSinceHistory($token, $this->historyId);
-        
-        foreach ($messages as $message) {
-            $this->processMessage($message, $company);
-        }
-    }
-    
-    private function processMessage($message, $company) {
-        $gmailService = app(GmailService::class);
-        
-        // Check if has invoice attachment (XML or PDF)
-        if (!$this->hasInvoiceAttachment($message)) {
-            return;
+        if (Cache::has($cacheKey)) {
+            Log::info('Gmail Webhook: DUPLICATE SKIPPED');
+            return response()->json(['status' => 'ok']);
         }
         
-        // Download attachments
-        $attachments = $gmailService->getAttachments($message->id);
+        Cache::put($cacheKey, true, now()->addMinutes(5));
         
-        foreach ($attachments as $attachment) {
-            if ($this->isInvoiceFile($attachment)) {
-                $this->parseAndCreateInvoice($attachment, $company);
-            }
-        }
-    }
-    
-    private function hasInvoiceAttachment($message) {
-        $subject = $message->subject ?? '';
-        $body = $message->body ?? '';
+        // Dispatch job immediately (no afterResponse to avoid delays)
+        ProcessNewGmailMessage::dispatch((int) $companyId, (string) $historyId)
+            ->onQueue('gmail');
         
-        // Keywords
-        $keywords = ['hóa đơn', 'invoice', 'hoadon', 'bill'];
-        
-        foreach ($keywords as $keyword) {
-            if (stripos($subject, $keyword) !== false || 
-                stripos($body, $keyword) !== false) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
-    
-    private function isInvoiceFile($attachment) {
-        $extension = pathinfo($attachment->filename, PATHINFO_EXTENSION);
-        return in_array(strtolower($extension), ['xml', 'pdf', 'zip']);
-    }
-}
-```
-
----
-
-## Parse XML Invoice
-
-### Cấu Trúc XML Hóa Đơn Điện Tử
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<Invoice>
-    <InvoiceNo>0001234</InvoiceNo>
-    <InvoiceDate>2025-01-24</InvoiceDate>
-    <Seller>
-        <Name>CÔNG TY ABC</Name>
-        <TaxCode>0123456789</TaxCode>
-        <Address>123 Đường ABC, Hà Nội</Address>
-    </Seller>
-    <Buyer>
-        <Name>CÔNG TY XYZ</Name>
-        <TaxCode>9876543210</TaxCode>
-    </Buyer>
-    <Items>
-        <Item>
-            <Name>Laptop Dell</Name>
-            <Quantity>2</Quantity>
-            <UnitPrice>15000000</UnitPrice>
-            <VATRate>10</VATRate>
-        </Item>
-    </Items>
-    <SubTotal>30000000</SubTotal>
-    <VATAmount>3000000</VATAmount>
-    <GrandTotal>33000000</GrandTotal>
-</Invoice>
-```
-
-### Parser
-
-```php
-// app/Services/Utils/InvoiceXMLParser.php
-class InvoiceXMLParser {
-    public function parse(string $xmlContent): array {
-        $xml = simplexml_load_string($xmlContent);
-        
-        return [
-            'invoice_number' => (string) $xml->InvoiceNo,
-            'invoice_date' => (string) $xml->InvoiceDate,
-            'seller' => [
-                'name' => (string) $xml->Seller->Name,
-                'tax_id' => (string) $xml->Seller->TaxCode,
-                'address' => (string) $xml->Seller->Address,
-            ],
-            'buyer' => [
-                'name' => (string) $xml->Buyer->Name,
-                'tax_id' => (string) $xml->Buyer->TaxCode,
-            ],
-            'items' => $this->parseItems($xml->Items->Item),
-            'subtotal' => (float) $xml->SubTotal,
-            'vat_amount' => (float) $xml->VATAmount,
-            'grand_total' => (float) $xml->GrandTotal,
-        ];
-    }
-    
-    private function parseItems($items): array {
-        $result = [];
-        
-        foreach ($items as $item) {
-            $result[] = [
-                'name' => (string) $item->Name,
-                'quantity' => (float) $item->Quantity,
-                'unit_price' => (float) $item->UnitPrice,
-                'vat_rate' => (float) $item->VATRate,
-            ];
-        }
-        
-        return $result;
-    }
-}
-```
-
----
-
-## Tạo Hóa Đơn Tự Động
-
-### Từ Dữ Liệu Đã Parse
-
-```php
-private function parseAndCreateInvoice($attachment, $company) {
-    try {
-        // Parse XML
-        $parser = app(InvoiceXMLParser::class);
-        $data = $parser->parse($attachment->content);
-        
-        DB::transaction(function() use ($data, $company) {
-            // Find or create supplier
-            $supplier = $this->findOrCreateSupplier($data['seller'], $company);
-            
-            // Create purchase invoice
-            $invoice = PurchaseInvoice::create([
-                'company_id' => $company->id,
-                'supplier_id' => $supplier->id,
-                'purchase_number' => $data['invoice_number'],
-                'purchase_date' => $data['invoice_date'],
-                'currency' => 'VND',
-                'status' => 'pending',  // Chờ duyệt
-                'subtotal' => $data['subtotal'],
-                'vat_amount' => $data['vat_amount'],
-                'grand_total' => $data['grand_total'],
-                'source' => 'email',  // Đánh dấu từ email
-            ]);
-            
-            // Create items
-            foreach ($data['items'] as $itemData) {
-                // Find or create product
-                $product = $this->findOrCreateProduct($itemData, $company);
-                
-                PurchaseItem::create([
-                    'purchase_id' => $invoice->id,
-                    'product_id' => $product->id,
-                    'quantity' => $itemData['quantity'],
-                    'unit_price' => $itemData['unit_price'],
-                    'vat_rate' => $itemData['vat_rate'],
-                    'total_price' => $itemData['quantity'] * $itemData['unit_price'],
-                ]);
-            }
-            
-            // Notify user
-            $this->notifyUser($company, $invoice);
-        });
-    } catch (\Exception $e) {
-        // Log error
-        \Log::error('Invoice parsing failed', [
-            'error' => $e->getMessage(),
-            'company_id' => $company->id,
+        Log::info('Gmail Webhook: JOB QUEUED', [
+            'elapsed_ms' => round((microtime(true) - $startTime) * 1000, 2),
         ]);
     }
-}
-
-private function findOrCreateSupplier($sellerData, $company) {
-    return Supplier::firstOrCreate(
-        [
-            'company_id' => $company->id,
-            'tax_id' => $sellerData['tax_id'],
-        ],
-        [
-            'supplier_name' => $sellerData['name'],
-            'address' => $sellerData['address'],
-        ]
-    );
+    
+    // ALWAYS return 200 OK quickly
+    return response()->json(['status' => 'ok'], 200);
 }
 ```
 
+**Key Points**:
+- ✅ Fast response (< 50ms) prevents Google retries
+- ✅ Deduplication prevents duplicate processing
+- ✅ No `afterResponse()` - dispatch immediately
+
 ---
 
-## Thông Báo Người Dùng
+## Email Processing Jobs
 
-### Real-time Notification
+### 1. ProcessNewGmailMessage (Webhook Trigger)
 
 ```php
-private function notifyUser($company, $invoice) {
-    // Broadcast to company channel
-    event(new InvoiceReceivedViaEmail($invoice));
+// app/Jobs/ProcessNewGmailMessage.php
+
+public function handle(GmailService $gmailService) {
+    $config = Config::withoutGlobalScopes()->where('company_id', $this->companyId)->first();
+    $client = $gmailService->buildGoogleClient($config);
+    $service = new Gmail($client);
     
-    // Send email to admins
-    $admins = User::where('company_id', $company->id)
-        ->whereHas('role', function($q) {
-            $q->where('code', 'admin');
-        })
-        ->get();
-    
-    foreach ($admins as $admin) {
-        $admin->notify(new NewInvoiceFromEmail($invoice));
+    try {
+        // Fetch histories from last checkpoint
+        $historyList = $service->users_history->listUsersHistory('me', [
+            'startHistoryId' => $config->gmail_last_history_id,
+            'historyTypes' => ['messageAdded'],
+            'labelId' => 'INBOX',
+        ]);
+        
+        // Process each message
+        foreach ($historyList->getHistory() as $history) {
+            $messagesAdded = $history->getMessagesAdded() ?? [];
+            
+            foreach ($messagesAdded as $messageAdded) {
+                $messageId = $messageAdded->getMessage()->getId();
+                
+                // Process: notify, filter, import
+                $this->processMessage($service, $messageId, $company);
+           }
+        }
+        
+        // Update checkpoint
+        $config->gmail_last_history_id = (string) $this->historyId;
+        $config->save();
+        
+    } catch (GoogleServiceException $e) {
+        if ($e->getCode() === 404) {
+            // History not found (historyId too old)
+            Log::warning('ProcessNewGmailMessage: using fallback');
+            
+            // Fallback: fetch latest inbox messages
+            $this->processLatestInboxMessages($service);
+            
+            $config->gmail_last_history_id = (string) $this->historyId;
+            $config->save();
+        }
     }
 }
-```
 
----
-
-## Manual Scan
-
-### Quét Email Thủ Công
-
-```php
-// app/Livewire/Main/Settings/GmailSettings.php
-public function scanNow() {
-    $company = Auth::user()->company;
-    $token = $company->config->getSetting('gmail_settings.access_token');
+protected function processMessage(Gmail $service, string $messageId, Company $company): void {
+    $message = $service->users_messages->get('me', $messageId, ['format' => 'full']);
+    [$subject, $fromEmail, $fromName, $snippet] = $this->parseMessageHeaders($message);
+    [$hasXml, $attachmentNames, $parts, $xmlCount] = $this->detectAttachments($message);
     
-    if (!$token) {
-        $this->addError('gmail', 'Chưa kết nối Gmail');
+    // 1. ALWAYS notify user first
+    $this->notifyEmail($messageId, $subject, $fromEmail, ...);
+    
+    // 2. Check keyword filter AFTER notification
+    if (!$this->shouldProcessEmail($subject)) {
+        Log::debug('Email skipped (keyword filter)');
+        ProcessedEmail::create(['status' => 'skipped']);
         return;
     }
     
-    // Dispatch job
-    GmailScanJob::dispatchSync($company->id, null);
+    // 3. Process if has keyword
+    if ($hasXml) {
+        // Extract and import invoice
+        $xmlContents = $this->extractXmlContents($service, $messageId, $parts);
+        $this->importInvoices(...);
+    } else {
+        // Warn user: has keyword but no XML
+        $this->notifyNoXmlFound($subject, $fromEmail, $messageId, $links);
+    }
+}
+```
+
+### 2. RescanAllEmailsJob (Manual Scan)
+
+Same logic as ProcessNewGmailMessage but:
+- Fetch latest N emails from INBOX (configurable: 5-200)
+- Stop when hitting already-processed email
+- Used for initial scan and manual rescan
+
+```php
+// Dispatch từ Settings > Automation
+RescanAllEmailsJob::dispatch(
+    $company->id,
+    $this->rescan_email_limit,  // From settings (default: 50)
+    $this->allow_rescan_processed  // Re-process already scanned emails?
+)->onQueue('gmail');
+```
+
+---
+
+## Keyword Filtering
+
+### Configuration
+
+```php
+// config/setting.php
+'email_scan_keywords' => [
+    'type' => 'array',
+    'default' => ['hóa đơn', 'invoice', 'bill', 'receipt'],
+    'description' => 'Keywords to filter emails (case-insensitive)',
+],
+```
+
+### shouldProcessEmail() Method
+
+```php
+protected function shouldProcessEmail(?string $subject): bool {
+    $keywords = Config::getSetting('automation_settings.email_scan_keywords', []);
     
-    $this->message = 'Đã quét email thành công!';
+    if (empty($keywords)) {
+        return true; // Process all if no keywords
+    }
+    
+    $subjectLower = mb_strtolower($subject, 'UTF-8');
+    
+    foreach ($keywords as $keyword) {
+        if (mb_stripos($subjectLower, mb_strtolower($keyword, 'UTF-8')) !== false) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+```
+
+**Flow**:
+1. Notify user (ALL emails)
+2. Check keywords
+3. Skip if no match
+4. Process if match
+
+---
+
+## Notifications
+
+### 1. New Email Notification
+
+```php
+protected function notifyEmail(...) {
+    CompanyNotification::create([
+        'company_id' => $this->companyId,
+        'type' => 'info',
+        'title' => 'Email mới từ: ' . $fromEmail,
+        'body' => $subject,
+        'data' => [
+            'message_id' => $messageId,
+            'from' => $fromEmail,
+            'attachments' => $attachmentNames,
+        ],
+    ]);
+    
+    event(new CompanyNotificationCreated($this->companyId, null, 'info'));
+}
+```
+
+### 2. No XML Warning
+
+```php
+protected function notifyNoXmlFound(...) {
+    CompanyNotification::create([
+        'company_id' => $this->companyId,
+        'type' => 'warning',
+        'title' => 'Email hóa đơn không có file XML',
+        'body' => "Email từ {$fromEmail} có tiêu đề '{$subject}' chứa từ khóa hóa đơn nhưng không có file XML đính kèm. Vui lòng kiểm tra thủ công.",
+    ]);
+    
+    event(new CompanyNotificationCreated($this->companyId, null, 'warning'));
 }
 ```
 
 ---
 
-## Xử Lý Lỗi
+## Settings UI
 
-### Refresh Token Khi Hết Hạn
+### Automation Settings
 
 ```php
-// app/Services/Utils/GmailService.php
-private function getClient($company) {
-    $client = new \Google_Client();
+// resources/views/livewire/main/settings/automation-settings.blade.php
+
+<div>
+    <!-- Rescan Email Limit -->
+    <input wire:model="rescan_email_limit" 
+           type="number" min="5" max="200" />
+    <p class="text-sm">Số lượng email quét tối đa (5-200)</p>
     
-    $settings = $company->config->getSetting('gmail_settings');
-    $accessToken = $settings['access_token'];
-    
-    $client->setAccessToken($accessToken);
-    
-    // Check if expired
-    if ($client->isAccessTokenExpired()) {
-        if (isset($settings['refresh_token'])) {
-            // Refresh
-            $newToken = $client->fetchAccessTokenWithRefreshToken($settings['refresh_token']);
-            
-            // Update
-            $company->config->updateSetting('gmail_settings.access_token', $newToken['access_token']);
-            
-            $client->setAccessToken($newToken);
-        } else {
-            throw new \Exception('Token hết hạn, cần kết nối lại Gmail');
+    <!-- Email Scan Keywords -->
+    <div x-data="{
+        keywords: @entangle('email_scan_keywords'),
+        newKeyword: '',
+        addKeyword() {
+            if (this.newKeyword.trim()) {
+                this.keywords.push(this.newKeyword.trim());
+                this.newKeyword = '';
+            }
+        },
+        removeKeyword(index) {
+            this.keywords.splice(index, 1);
         }
-    }
+    }">
+        <!-- Keyword tags -->
+        <div class="flex flex-wrap gap-2">
+            <template x-for="(keyword, index) in keywords" :key="index">
+                <span class="badge">
+                    <span x-text="keyword"></span>
+                    <button @click="removeKeyword(index)">×</button>
+                </span>
+            </template>
+        </div>
+        
+        <!-- Add keyword -->
+        <input type="text" x-model="newKeyword" 
+               @keydown.enter.prevent="addKeyword()" 
+               placeholder="Nhập từ khóa (vd: hóa đơn, invoice)" />
+        <button @click="addKeyword()">Thêm</button>
+    </div>
     
-    return $client;
-}
+    <p class="text-xs text-slate-500">
+        Chỉ quét email có tiêu đề chứa ít nhất 1 từ khóa. Để trống để quét tất cả.
+    </p>
+</div>
+```
+
+---
+
+## Queue Worker
+
+### Start Worker
+
+```bash
+php artisan queue:work --queue=gmail,default --tries=3 --timeout=3600
+```
+
+**Critical**: Worker phải chạy liên tục để xử lý webhook jobs. Restart worker khi:
+- Deploy code mới
+- Update `.env`
+- Fix bugs
+
+---
+
+## Troubleshooting
+
+### 1. Webhook không nhận được
+
+```bash
+# Check route
+php artisan route:list | grep webhook
+# Should show: POST  api/gmail/webhook
+
+# Check logs
+tail -f storage/logs/laravel.log | grep "Gmail Webhook"
+
+# Test locally
+curl -X POST http://localhost:8000/api/gmail/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"message":{"data":"eyJoaXN0b3J5SWQiOiIxMjM0NSIsImVtYWlsQWRkcmVzcyI6InRlc3RAZ21haWwuY29tIn0="}}'
+```
+
+### 2. Config Not Found Error
+
+```bash
+# Check if Config uses Global Scope
+# Fix: Use withoutGlobalScopes() in jobs
+
+$config = Config::withoutGlobalScopes()
+    ->where('company_id', $this->companyId)
+    ->first();
+```
+
+### 3. History API 404 Error
+
+**Expected behavior** - Falls back to `processLatestInboxMessages()` automatically.
+
+Check logs:
+```
+ProcessNewGmailMessage: history not found (historyId too old), using fallback
 ```
 
 ---
 
 ## Quick Reference
 
-### Setup Checklist
+### Complete Email Flow
 
 ```
-✅ Google Cloud project
-✅ Enable Gmail API + Pub/Sub
-✅ OAuth credentials
-✅ Service account JSON
-✅ .env config
-✅ Webhook URL public
-✅ Setup watch
-✅ Test with real email
+1. Gmail receives email
+2. Google Pub/Sub → /api/gmail/webhook
+3. Webhook deduplicates & dispatches job
+4. ProcessNewGmailMessage:
+   - Fetch histories (or fallback to latest inbox)
+   - For each message:
+     a. Notify user (ALL emails)
+     b. Check keywords
+     c. Skip if no match
+     d. If match + has XML → Import invoice
+     e. If match + no XML → Warn user
+5. Update checkpoint (gmail_last_history_id)
 ```
 
-### Flow
+### Key Files
 
-```
-Gmail → Pub/Sub → Webhook → Queue Job → Parse XML → Create Invoice → Notify
-```
+| File | Purpose |
+|------|---------|
+| `GmailOAuthController.php` | OAuth connect/disconnect |
+| `GmailWebhookController.php` | Receive Pub/Sub notifications |
+| `ProcessNewGmailMessage.php` | Process webhook triggers |
+| `RescanAllEmailsJob.php` | Manual/scheduled scan |
+| `StartGmailWatch.php` | Setup Gmail push notifications |
+| `config/setting.php` | Email scan settings |
+| `automation-settings.blade.php` | Settings UI |
 
 ---
 
-## Tiếp Theo
+## Next Steps
 
-✅ Email scanning đã hiểu!
+✅ Email scanning system documented!
 
-**Tiếp tục:**
+**Continue:**
 - [AI Chatbot](11-ai-chatbot.md)
-- [Thông Báo](12-notification-system.md)
+- [Notification System](12-notification-system.md)
 - [Cache System](13-cache-system.md)
 
 ---
 
 <p align="center">
-  <strong>Email Automation Thành Thạo! 📧</strong>
+  <strong>Email Automation Mastered! 📧</strong>
 </p>
