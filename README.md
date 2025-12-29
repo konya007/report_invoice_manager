@@ -46,6 +46,16 @@
 | 17 | [**Components**](17-components-and-utilities.md) | Reusable components, utilities |
 | 18 | [**DataTables**](18-livewire-datatables.md) | Laravel Livewire Tables guide |
 
+### 🧩 Phase 5: Extended Features
+
+| # | File | Description |
+|---|------|-------------|
+| 19 | [**Warranty System**](19-warranty-system.md) | Hệ thống bảo hành & hạn sử dụng |
+| 20 | [**Currency System**](20-currency-system.md) | Tỷ giá & chuyển đổi tiền tệ |
+| 21 | [**Inventory FIFO**](21-inventory-system-fifo.md) | Chi tiết thuật toán FIFO & Transactions |
+| 22 | [**Product Conversion**](22-product-conversion-system.md) | Chuyển đổi và lắp ráp sản phẩm |
+| 23 | [**Banking & VietQR**](23-banking-and-vietqr.md) | Tích hợp ngân hàng & VietQR API |
+
 ---
 
 ## 🚀 Quick Start
@@ -62,6 +72,8 @@
 - **Tồn kho** → [08-inventory-system.md](08-inventory-system.md)
 - **AI Chatbot** → [11-ai-chatbot.md](11-ai-chatbot.md)
 - **API** → [04-auth-and-middleware.md](04-auth-and-middleware.md)
+- **Bảo hành** → [19-warranty-system.md](19-warranty-system.md)
+- **Tỷ giá** → [20-currency-system.md](20-currency-system.md)
 
 ---
 
